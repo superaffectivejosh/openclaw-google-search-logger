@@ -1,11 +1,10 @@
-
 # OpenClaw Google Search Logger
 
-Capture your **Google searches as a personal curiosity log** and make them available to your OpenClaw agents.
+Capture your **Google searches and Google Image searches as a personal curiosity log** and make them available to your OpenClaw agents.
 
 This project runs a lightweight Python daemon that reads your local Chrome history and writes searches into **daily Markdown files** inside your OpenClaw workspace.
 
-```
+```text
 Chrome searches
       ↓
 Python logger
@@ -19,57 +18,58 @@ OpenClaw workspace
 Agents like Pika can read them
 ```
 
-The result is a **continuous log of what you're exploring, learning, and researching** — perfect input for AI assistants.
+The result is a **continuous log of what you're exploring, learning, researching, and visually ideating** — perfect input for AI assistants.
 
 ---
 
-# Why this exists
+## Why this exists
 
-Search queries are an incredibly high‑signal personal dataset.
+Search queries are an incredibly high-signal personal dataset.
 
 They reveal:
-
 - what you're trying to learn
 - problems you're solving
 - rabbit holes you're exploring
 - your evolving interests over time
+- when you're doing technical research vs visual inspiration hunting
 
 Yet almost nobody captures them in a usable form.
 
-This project turns your search history into a **clean, human‑readable dataset** that can power AI agents, reflection tools, and personal knowledge systems.
+This project turns your search history into a **clean, human-readable dataset** that can power AI agents, reflection tools, and personal knowledge systems.
 
 For OpenClaw users, it becomes a **natural input stream for your agents**.
 
 ---
 
-# Features
+## Features
 
-- Local‑first
+- Local-first
 - No browser extension
 - No cloud API
 - No external dependencies
-- Human‑readable Markdown output
+- Human-readable Markdown output
 - Designed for OpenClaw workspaces
 - Runs automatically via launchd
 - Deduplicates repeated searches
-- Append‑only logging
+- Append-only logging
+- Distinguishes between regular Google searches and Google Image searches
 
 ---
 
-# Example output
+## Example output
 
 ```md
 # Google Searches
 Date: 2026-03-14
 
-10:21:44 — openai realtime api openclaw telegram
-10:43:11 — chrome history sqlite schema
-11:02:09 — supabase edge function webhook tutorial
+10:21:44 — [web] openai realtime api openclaw telegram
+10:43:11 — [image] cute pikachu wallpaper
+11:02:09 — [web] chrome history sqlite schema
 ```
 
 Each day gets its own file:
 
-```
+```text
 ~/.openclaw/workspace/google-searches/
 
 2026-03-14.md
@@ -81,7 +81,29 @@ These files sync automatically if your OpenClaw workspace is synced with Google 
 
 ---
 
-# Installation
+## How Google Image Search detection works
+
+The logger uses the same simple URL-query-string approach as regular Google Search.
+
+It looks for Google URLs like:
+
+```text
+https://www.google.com/search?q=...
+```
+
+Then:
+
+- extracts the search text from the `q` parameter
+- checks whether `tbm=isch` is present
+- logs the search as:
+  - `[image]` when `tbm=isch`
+  - `[web]` otherwise
+
+This is a practical heuristic for personal logging and works well for common Google Images flows.
+
+---
+
+## Installation
 
 Clone the repo:
 
@@ -98,7 +120,7 @@ chmod +x google_search_logger.py
 
 ---
 
-# Run manually
+## Run manually
 
 Start the logger:
 
@@ -108,7 +130,7 @@ python3 google_search_logger.py
 
 You should see startup diagnostics like:
 
-```
+```text
 google_search_logger starting
 Python executable: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
 Chrome profile: Default
@@ -118,22 +140,31 @@ Output dir: ~/.openclaw/workspace/google-searches
 
 When searches are captured:
 
-```
-[logged] 2026-03-14 10:21:44 — openai realtime api openclaw telegram
+```text
+[logged] 2026-03-14 10:21:44 — [web] openai realtime api openclaw telegram
+[logged] 2026-03-14 10:43:11 — [image] cute pikachu wallpaper
 ```
 
 ---
 
-# Testing
+## Testing
 
-1. Run the logger
-2. Make a Google search:
+1. Run the logger.
+2. Make a regular Google search:
 
+```text
+pika logger web test 847263
 ```
-pika logger test 847263
+
+3. Make a Google Image search:
+
+```text
+cute pikachu wallpaper
 ```
 
-3. Wait about 60 seconds
+Then click **Images** in Google, or search directly in Google Images.
+
+4. Wait about 60 seconds.
 
 Check the output file:
 
@@ -141,15 +172,15 @@ Check the output file:
 tail ~/.openclaw/workspace/google-searches/$(date +%F).md
 ```
 
-You should see your search logged.
+You should see new lines with `[web]` and `[image]` tags.
 
 ---
 
-# Run automatically (recommended)
+## Run automatically with launchd
 
 Create a launch agent:
 
-```
+```text
 ~/Library/LaunchAgents/com.josh.google-search-logger.plist
 ```
 
@@ -193,13 +224,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.josh.google-search-l
 
 ---
 
-# Chrome profile configuration
+## Chrome profile configuration
 
 The logger tries profiles in this order:
 
-1. `GOOGLE_SEARCH_LOGGER_PROFILE` environment variable  
-2. `Default`  
-3. First `Profile *` directory  
+1. `GOOGLE_SEARCH_LOGGER_PROFILE` environment variable
+2. `Default`
+3. First `Profile *` directory
 
 To force a profile:
 
@@ -209,7 +240,7 @@ export GOOGLE_SEARCH_LOGGER_PROFILE="Profile 1"
 
 Find your profile using:
 
-```
+```text
 chrome://version
 ```
 
@@ -217,12 +248,11 @@ Look for **Profile Path**.
 
 ---
 
-# Architecture
+## Architecture
 
 This project intentionally keeps the architecture **minimal and robust**.
 
 No:
-
 - browser extension
 - database
 - API server
@@ -231,7 +261,7 @@ No:
 
 Just:
 
-```
+```text
 Chrome → Python → Markdown
 ```
 
@@ -239,13 +269,13 @@ This makes the system extremely reliable and easy to inspect.
 
 ---
 
-# OpenClaw integration ideas
+## OpenClaw integration ideas
 
 Once you have this data, your agents can do interesting things.
 
 ### Daily curiosity summaries
 
-```
+```text
 Daily Curiosity Summary
 
 Primary themes:
@@ -253,10 +283,15 @@ Primary themes:
 • Chrome automation
 • AI agent memory systems
 
+Visual inspiration:
+• Pikachu references
+• UI inspiration
+• brand imagery
+
 Questions explored:
 • How to log browser search history
 • Launchd background services
-• AI agent memory pipelines
+• Agent memory pipelines
 ```
 
 ### Knowledge graph generation
@@ -271,27 +306,31 @@ Detect repeated searches across days.
 
 Understand how you arrived at ideas.
 
+### Visual ideation tracking
+
+Understand when you were searching for images vs researching on the web.
+
 ---
 
-# Design philosophy
+## Design philosophy
 
 This project follows three principles.
 
-### Local‑first
+### Local-first
 
 Your searches never leave your machine.
 
-### Human‑readable
+### Human-readable
 
 Markdown files you can browse anytime.
 
-### Agent‑ready
+### Agent-ready
 
 A clean input stream for AI systems.
 
 ---
 
-# Future ideas
+## Future ideas
 
 Possible extensions:
 
@@ -300,31 +339,34 @@ Possible extensions:
 - YouTube search capture
 - GitHub repo capture
 - Curiosity dashboards
-- OpenClaw auto‑summaries
+- OpenClaw auto-summaries
+- richer Google vertical detection beyond web and image
 
 ---
 
-# Contributing
+## Contributing
 
 PRs welcome.
 
 Good contributions:
-
 - additional browser support
 - improved profile detection
 - better deduplication logic
 - agent integrations
+- broader Google search vertical classification
 
 ---
 
-# License
+## License
 
 MIT
 
 ---
 
-# Final thought
+## Final thought
 
 Search queries are a **personal intellectual telemetry stream**.
 
-This project turns them into a dataset your AI agents can understand.
+And image searches add another layer: **visual curiosity**.
+
+This project turns both into a dataset your AI agents can understand.

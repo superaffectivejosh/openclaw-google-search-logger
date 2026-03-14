@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-
 """
 Google Search Logger → OpenClaw Workspace
 
-Captures Google search queries from Chrome history and writes them
+Captures Google search queries from local Chrome history and writes them
 to daily Markdown files in:
 
-~/.openclaw/workspace/google-searches/YYYY-MM-DD.md
+    ~/.openclaw/workspace/google-searches/YYYY-MM-DD.md
 
 Each entry format:
 
-HH:MM:SS — search query
+    HH:MM:SS — [web] search query
+    HH:MM:SS — [image] image search query
 
-Key improvements in v2:
-- auto-discovers Chrome profiles instead of assuming Default
-- clearer startup diagnostics
-- safer handling when Chrome history path is missing
-- optional override via env vars
+If a daily file does not yet exist, the logger creates it with a simple header:
+
+    # Google Searches
+    Date: YYYY-MM-DD
+
+Design goals:
+- simple
+- local-first
+- append-only
+- stdlib only
+- safe reading of Chrome's SQLite history DB via a copied temp file
+- avoid duplicate writes even if history is replayed or state is reset
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -32,17 +40,29 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
-DEFAULT_USER_DATA_DIR = Path("~/Library/Application Support/Google/Chrome").expanduser()
+
+CHROME_USER_DATA_DIR = Path(
+    "~/Library/Application Support/Google/Chrome"
+).expanduser()
+
 OUTPUT_DIR = Path("~/.openclaw/workspace/google-searches").expanduser()
 STATE_FILE = Path("~/.google_search_logger_state.json").expanduser()
+
 INTERVAL_SECONDS = 60
 DEDUPE_MINUTES = 10
 
-# Optional overrides
-USER_DATA_DIR = Path(os.getenv("GOOGLE_SEARCH_LOGGER_USER_DATA_DIR", str(DEFAULT_USER_DATA_DIR))).expanduser()
-PROFILE_OVERRIDE = os.getenv("GOOGLE_SEARCH_LOGGER_PROFILE", "").strip()
+GOOGLE_SEARCH_HOSTS = {
+    "www.google.com",
+    "google.com",
+    "images.google.com",
+}
+
+LOG_LINE_RE = re.compile(
+    r"^(?P<time>\d{2}:\d{2}:\d{2})\s+—\s+(?:\[(?P<tag>[a-z]+)\]\s+)?(?P<query>.+?)\s*$"
+)
 
 
 class GracefulExit(SystemExit):
@@ -50,7 +70,7 @@ class GracefulExit(SystemExit):
 
 
 def _handle_signal(signum, _frame):
-    raise GracefulExit(f"received signal {signum}")
+    raise GracefulExit(f"Received signal {signum}")
 
 
 signal.signal(signal.SIGINT, _handle_signal)
@@ -62,106 +82,202 @@ def chrome_time_to_datetime(microseconds: int) -> datetime:
     return chrome_epoch + timedelta(microseconds=microseconds)
 
 
-def normalize_query(q: str) -> str:
-    return " ".join(q.strip().split()).lower()
+def normalize_query(query: str) -> str:
+    return " ".join(query.strip().split()).lower()
 
 
-def extract_google_query(url: str) -> str | None:
+def classify_google_search(url: str) -> Optional[dict]:
+    """
+    Returns a dict like:
+        {"query": "...", "search_type": "web"}
+        {"query": "...", "search_type": "image"}
+
+    Practical heuristic:
+    - Any recognized Google search URL with a q=... param is a search
+    - images.google.com => image search
+    - tbm=isch => image search
+    - udm=2 => image search
+    - otherwise => web search
+    """
     try:
         parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
 
-        if hostname not in {"www.google.com", "google.com"}:
+        if parsed.scheme not in ("http", "https"):
             return None
 
-        if parsed.path != "/search":
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in GOOGLE_SEARCH_HOSTS:
+            return None
+
+        if hostname == "images.google.com":
+            allowed_paths = {"/", "/search"}
+        else:
+            allowed_paths = {"/search"}
+
+        if parsed.path not in allowed_paths:
             return None
 
         params = parse_qs(parsed.query)
-        values = params.get("q")
-        if not values:
+        if "q" not in params:
             return None
 
-        q = unquote_plus(values[0]).strip()
-        return q or None
+        query = unquote_plus(params["q"][0]).strip()
+        if not query:
+            return None
+
+        tbm = params.get("tbm", [""])[0].strip().lower()
+        udm = params.get("udm", [""])[0].strip().lower()
+
+        if hostname == "images.google.com" or tbm == "isch" or udm == "2":
+            search_type = "image"
+        else:
+            search_type = "web"
+
+        return {
+            "query": query,
+            "search_type": search_type,
+        }
+
     except Exception:
         return None
 
 
+def discover_profile_name() -> str:
+    env_profile = os.getenv("GOOGLE_SEARCH_LOGGER_PROFILE", "").strip()
+
+    if env_profile:
+        history_path = CHROME_USER_DATA_DIR / env_profile / "History"
+        if history_path.exists():
+            return env_profile
+        raise FileNotFoundError(
+            f"GOOGLE_SEARCH_LOGGER_PROFILE was set to {env_profile!r}, "
+            f"but no History file exists at {history_path}"
+        )
+
+    default_history = CHROME_USER_DATA_DIR / "Default" / "History"
+    if default_history.exists():
+        return "Default"
+
+    if CHROME_USER_DATA_DIR.exists():
+        for child in sorted(CHROME_USER_DATA_DIR.iterdir()):
+            if child.is_dir() and child.name.startswith("Profile "):
+                history_path = child / "History"
+                if history_path.exists():
+                    return child.name
+
+    raise FileNotFoundError(
+        "Could not find a Chrome History file. Check chrome://version for Profile Path, "
+        "or set GOOGLE_SEARCH_LOGGER_PROFILE."
+    )
+
+
+def history_path_for_profile(profile_name: str) -> Path:
+    return CHROME_USER_DATA_DIR / profile_name / "History"
+
+
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"profiles": {}, "dedupe": {}}
-
-    with open(STATE_FILE, encoding="utf-8") as f:
-        state = json.load(f)
-
-    if "profiles" not in state:
-        # migrate from old single-profile format
-        last_visit_time = int(state.get("last_visit_time", 0))
-        state = {
-            "profiles": {"Default": {"last_visit_time": last_visit_time}},
-            "dedupe": state.get("dedupe", {}),
+        return {
+            "last_visit_time": 0,
+            "dedupe": {},
+            "profile_name": None,
         }
 
-    state.setdefault("profiles", {})
-    state.setdefault("dedupe", {})
-    return state
+    with STATE_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    data.setdefault("last_visit_time", 0)
+    data.setdefault("dedupe", {})
+    data.setdefault("profile_name", None)
+    return data
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
+    tmp.replace(STATE_FILE)
 
 
-def write_search(query: str, dt: datetime) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def prune_dedupe_map(state: dict) -> None:
+    cutoff = datetime.now().astimezone() - timedelta(minutes=DEDUPE_MINUTES * 3)
+    keep = {}
+    for key, iso_ts in state.get("dedupe", {}).items():
+        try:
+            dt = datetime.fromisoformat(iso_ts)
+        except Exception:
+            continue
+        if dt >= cutoff:
+            keep[key] = iso_ts
+    state["dedupe"] = keep
+
+
+def ensure_daily_file(path: Path, day: datetime) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+
+    header = f"# Google Searches\nDate: {day.date().isoformat()}\n\n"
+    with path.open("w", encoding="utf-8") as f:
+        f.write(header)
+
+
+def line_already_present(path: Path, query: str, dt: datetime) -> bool:
+    """
+    Returns True if the exact same timestamp + query already exists in the file,
+    regardless of whether the existing line is legacy:
+        HH:MM:SS — query
+    or tagged:
+        HH:MM:SS — [web] query
+        HH:MM:SS — [image] query
+    """
+    if not path.exists():
+        return False
+
+    target_time = dt.strftime("%H:%M:%S")
+    target_query = normalize_query(query)
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                m = LOG_LINE_RE.match(raw_line.strip())
+                if not m:
+                    continue
+                if m.group("time") != target_time:
+                    continue
+                if normalize_query(m.group("query")) == target_query:
+                    return True
+    except Exception:
+        return False
+
+    return False
+
+
+def write_search(query: str, search_type: str, dt: datetime) -> bool:
+    """
+    Writes the line and returns True if a new line was appended.
+    Returns False if the entry already exists.
+    """
     date_file = OUTPUT_DIR / f"{dt.date().isoformat()}.md"
+    ensure_daily_file(date_file, dt)
+
+    if line_already_present(date_file, query, dt):
+        return False
+
     time_str = dt.strftime("%H:%M:%S")
-    line = f"{time_str} — {query}\n"
-    with open(date_file, "a", encoding="utf-8") as f:
+    line = f"{time_str} — [{search_type}] {query}\n"
+
+    with date_file.open("a", encoding="utf-8") as f:
         f.write(line)
 
-
-def discover_profiles() -> list[str]:
-    if PROFILE_OVERRIDE:
-        history = USER_DATA_DIR / PROFILE_OVERRIDE / "History"
-        if history.exists():
-            return [PROFILE_OVERRIDE]
-        raise FileNotFoundError(
-            f"GOOGLE_SEARCH_LOGGER_PROFILE={PROFILE_OVERRIDE!r} was set, but no History file exists at {history}"
-        )
-
-    if not USER_DATA_DIR.exists():
-        raise FileNotFoundError(
-            f"Chrome user data directory not found: {USER_DATA_DIR}\n"
-            "If Chrome is installed in a different place/profile, set GOOGLE_SEARCH_LOGGER_USER_DATA_DIR."
-        )
-
-    profiles: list[str] = []
-    for child in sorted(USER_DATA_DIR.iterdir()):
-        if not child.is_dir():
-            continue
-        name = child.name
-        if name == "Default" or name.startswith("Profile "):
-            history = child / "History"
-            if history.exists():
-                profiles.append(name)
-
-    if not profiles:
-        raise FileNotFoundError(
-            f"No Chrome profiles with a History DB were found under {USER_DATA_DIR}.\n"
-            "Open chrome://version and check 'Profile Path', then either:\n"
-            "1) set GOOGLE_SEARCH_LOGGER_PROFILE to that profile directory name, or\n"
-            "2) set GOOGLE_SEARCH_LOGGER_USER_DATA_DIR if Chrome uses a different base directory."
-        )
-
-    return profiles
+    return True
 
 
-def query_history(history_path: Path, last_visit_time: int):
-    with tempfile.TemporaryDirectory() as tmpdir:
+def query_history(history_file: Path, last_visit_time: int):
+    with tempfile.TemporaryDirectory(prefix="chrome-history-copy-") as tmpdir:
         copied = Path(tmpdir) / "History"
-        shutil.copy2(history_path, copied)
+        shutil.copy2(history_file, copied)
 
         conn = sqlite3.connect(f"file:{copied}?mode=ro", uri=True)
         try:
@@ -182,94 +298,75 @@ def query_history(history_path: Path, last_visit_time: int):
     return rows
 
 
-def cleanup_dedupe(dedupe: dict[str, str]) -> None:
-    cutoff = datetime.now().astimezone() - timedelta(minutes=DEDUPE_MINUTES * 3)
-    stale = []
-    for key, value in dedupe.items():
-        try:
-            dt = datetime.fromisoformat(value)
-        except Exception:
-            stale.append(key)
-            continue
-        if dt < cutoff:
-            stale.append(key)
-    for key in stale:
-        dedupe.pop(key, None)
-
-
-def print_startup_info(profiles: list[str]) -> None:
-    print("Google Search Logger starting")
-    print(f"Chrome user data dir: {USER_DATA_DIR}")
-    print(f"Detected profiles: {', '.join(profiles)}")
-    print(f"Output dir: {OUTPUT_DIR}")
-    print(f"State file: {STATE_FILE}")
-    print(f"Poll interval: {INTERVAL_SECONDS}s")
-    print(f"Hostname: {socket.gethostname()}")
-
-
 def main() -> int:
     state = load_state()
+    profile_name = discover_profile_name()
+    history_file = history_path_for_profile(profile_name)
+    state["profile_name"] = profile_name
 
-    try:
-        profiles = discover_profiles()
-    except FileNotFoundError as e:
-        print("\nERROR: Could not find Chrome history to read.\n")
-        print(str(e))
-        print("\nMost likely cause: your active Chrome profile is not 'Default'.")
-        print("Fix:")
-        print("- Open chrome://version")
-        print("- Look at 'Profile Path'")
-        print("- Export GOOGLE_SEARCH_LOGGER_PROFILE to that directory name")
-        print("  Example: export GOOGLE_SEARCH_LOGGER_PROFILE='Profile 1'")
-        return 2
-
-    print_startup_info(profiles)
+    print("google_search_logger starting", flush=True)
+    print(f"Python executable: {sys.executable}", flush=True)
+    print(f"Machine: {socket.gethostname()}", flush=True)
+    print(f"Chrome profile: {profile_name}", flush=True)
+    print(f"Chrome history file: {history_file}", flush=True)
+    print(f"Output dir: {OUTPUT_DIR}", flush=True)
+    print(f"State file: {STATE_FILE}", flush=True)
 
     try:
         while True:
-            cleanup_dedupe(state["dedupe"])
+            prune_dedupe_map(state)
+            rows = query_history(history_file, int(state["last_visit_time"]))
+            max_seen = int(state["last_visit_time"])
 
-            for profile in profiles:
-                history_path = USER_DATA_DIR / profile / "History"
-                profile_state = state["profiles"].setdefault(profile, {"last_visit_time": 0})
-                last_visit_time = int(profile_state.get("last_visit_time", 0))
+            for visit_time, url in rows:
+                result = classify_google_search(url)
+                if not result:
+                    if int(visit_time) > max_seen:
+                        max_seen = int(visit_time)
+                    continue
 
-                rows = query_history(history_path, last_visit_time)
-                max_seen = last_visit_time
+                query = result["query"]
+                search_type = result["search_type"]
+                dt = chrome_time_to_datetime(int(visit_time)).astimezone()
+                dedupe_key = f"{search_type}::{normalize_query(query)}"
 
-                for visit_time, url in rows:
-                    query = extract_google_query(url)
-                    if visit_time > max_seen:
-                        max_seen = visit_time
-                    if not query:
-                        continue
+                last_seen_iso = state["dedupe"].get(dedupe_key)
+                if last_seen_iso:
+                    try:
+                        last_seen_dt = datetime.fromisoformat(last_seen_iso)
+                        if dt - last_seen_dt < timedelta(minutes=DEDUPE_MINUTES):
+                            if int(visit_time) > max_seen:
+                                max_seen = int(visit_time)
+                            continue
+                    except Exception:
+                        pass
 
-                    dt = chrome_time_to_datetime(visit_time).astimezone()
-                    key = f"{profile}::{normalize_query(query)}"
-                    last_seen = state["dedupe"].get(key)
+                wrote = write_search(query, search_type, dt)
+                state["dedupe"][dedupe_key] = dt.isoformat()
 
-                    if last_seen:
-                        try:
-                            last_dt = datetime.fromisoformat(last_seen)
-                            if dt - last_dt < timedelta(minutes=DEDUPE_MINUTES):
-                                continue
-                        except Exception:
-                            pass
+                if wrote:
+                    print(
+                        f"[logged] {dt.strftime('%Y-%m-%d %H:%M:%S')} — [{search_type}] {query}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[skipped-duplicate] {dt.strftime('%Y-%m-%d %H:%M:%S')} — [{search_type}] {query}",
+                        flush=True,
+                    )
 
-                    write_search(query, dt)
-                    state["dedupe"][key] = dt.isoformat()
-                    print(f"[logged:{profile}] {dt.strftime('%Y-%m-%d %H:%M:%S')} — {query}")
+                if int(visit_time) > max_seen:
+                    max_seen = int(visit_time)
 
-                profile_state["last_visit_time"] = max_seen
-
+            state["last_visit_time"] = max_seen
             save_state(state)
             time.sleep(INTERVAL_SECONDS)
 
-    except GracefulExit:
+    except GracefulExit as exc:
+        print(f"Shutting down: {exc}", flush=True)
         save_state(state)
-        print("Shutting down cleanly.")
         return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
